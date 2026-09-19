@@ -1,0 +1,9 @@
+{
+  "state_dir": "./state",
+  "concurrency": 4,
+  "retry": {
+    "base_seconds": 1.0,
+    "max_attempts": 3
+  },
+  "dag_file": "./dag.json"
+}

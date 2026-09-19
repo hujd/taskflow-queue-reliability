@@ -1,0 +1,27 @@
+{
+  "tasks": [
+    {
+      "id": "extract",
+      "run": "python3 scripts/extract.py --date 2026-09-19",
+      "needs": [],
+      "idempotency_key": "batch-2026-09-19-extract"
+    },
+    {
+      "id": "transform_users",
+      "run": "python3 scripts/transform.py --table users",
+      "needs": ["extract"],
+      "idempotency_key": "batch-2026-09-19-transform-users"
+    },
+    {
+      "id": "transform_orders",
+      "run": "python3 scripts/transform.py --table orders",
+      "needs": ["extract"],
+      "idempotency_key": "batch-2026-09-19-transform-orders"
+    },
+    {
+      "id": "load",
+      "run": "python3 scripts/load.py",
+      "needs": ["transform_users", "transform_orders"]
+    }
+  ]
+}
