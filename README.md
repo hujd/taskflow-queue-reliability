@@ -21,6 +21,7 @@ python3 -m taskflow retry  --config config.json --task <id>  # 把死信/失败�
   "state_dir": "./state",
   "concurrency": 4,
   "retry": {"base_seconds": 1.0, "max_attempts": 3},
+  "task_timeout_seconds": 600,
   "dag_file": "./dag.json"
 }
 ```
@@ -29,6 +30,9 @@ python3 -m taskflow retry  --config config.json --task <id>  # 把死信/失败�
 - `concurrency`：同时运行的任务数上限，严格不超过。
 - `retry.base_seconds` / `retry.max_attempts`：退避基数（秒）与最大尝试次数，
   第 n 次失败后的等待时间为 `base_seconds * 2^(n-1)`。
+- `task_timeout_seconds`：可选。单次尝试的硬超时；超时即判失败（退出码 124），
+  按正常退避/重试/死信规则处理，并杀掉任务子进程及其派生的整棵进程树。
+  不配置则不设超时。
 - `dag_file`：任务集合文件。相对路径一律相对于配置文件所在目录解析。
 
 ## 任务集合（dag.json）
@@ -45,6 +49,8 @@ python3 -m taskflow retry  --config config.json --task <id>  # 把死信/失败�
 
 - `run` 是一条 shell 命令（用 `shell=True` 执行），退出码非 0 视为失败。
 - `needs` 是上游任务 id 列表，可为空；所有上游成功后才调度，上游进死信则本任务标记为 `blocked`。
+  依赖必须指向本批次或此前已提交批次中真实存在的任务 id；指向不存在的 id 会在
+  提交时整批拒绝（退出码 2）并列出缺失项，绝不会带着缺失依赖把下游跑掉。
 - `idempotency_key` 可选；同一个 key 重复提交（哪怕换了任务 id）不会执行第二遍。
 
 ## 任务状态
@@ -58,7 +64,10 @@ python3 -m taskflow retry  --config config.json --task <id>  # 把死信/失败�
 - **不丢任务**：每次状态变迁都原子写盘（临时文件 + `os.replace` + `fsync`）。
 - **kill -9 / 断电恢复**：重启后 `running` 的任务重置为 `pending` 接着跑，
   `failed` 的按持久化的重试时间继续退避，`succeeded` 的绝不重跑。
-- **优雅停机**：收到 SIGTERM/SIGINT 后不再调度新任务，在手任务跑完、状态落盘后再退出。
+- **优雅停机**：收到 SIGTERM/SIGINT 后不再调度新任务，在手任务跑完、状态落盘后再退出；
+  被中断的一轮不算成功（还有任务没跑完时退出码非 0），只有全部成功才退出 0。
+- **任务超时**：超过 `task_timeout_seconds` 的尝试直接判失败，按退避重试、耗尽进死信；
+  被放弃的子进程连同其派生进程一起被 SIGTERM/SIGKILL 清理，不会滞留后台继续写数据。
 - **防并发冲突**：同一 `state_dir` 上有 flock 文件锁，两个 `run` 不会同时操作一份状态。
 
 ## 测试
