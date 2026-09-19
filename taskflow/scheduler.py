@@ -48,7 +48,11 @@ def refresh_blocked(tasks: dict) -> None:
 
 
 def requeue_task(store, task_id: str) -> dict:
-    """Reset a dead/failed task so the next ``run`` executes it again."""
+    """Reset a dead/failed task so the next ``run`` executes it again.
+
+    The attempt counter is reset as well, so a replayed task enjoys the
+    full backoff/retry budget instead of dying again after one try.
+    """
     tasks = store.tasks()
     if task_id not in tasks:
         raise KeyError(f"unknown task: {task_id}")
@@ -64,6 +68,8 @@ def requeue_task(store, task_id: str) -> dict:
         last_started_at=None,
         next_attempt_at=None,
         exit_code=None,
+        attempts=0,
+        pid=None,
     )
     refresh_blocked(tasks)
     return task
@@ -80,6 +86,10 @@ class Scheduler:
         self.max_attempts = int(retry.get("max_attempts", 1))
         if self.max_attempts < 1:
             raise ValueError("retry.max_attempts must be >= 1")
+        timeout = config.get("task_timeout_seconds")
+        self.task_timeout = None if timeout is None else float(timeout)
+        if self.task_timeout is not None and self.task_timeout <= 0:
+            raise ValueError("task_timeout_seconds must be > 0")
         self.logs_dir = os.path.join(store.state_dir, "logs")
         os.makedirs(self.logs_dir, exist_ok=True)
         self._stop_requested = False
@@ -92,9 +102,17 @@ class Scheduler:
         Returns the list of skipped (task_id, idempotency_key) duplicates.
         Tasks whose idempotency_key was seen before, or whose id already
         exists in state, are never added again and therefore never re-run.
+
+        Every dependency must resolve to a task from this submission or to
+        a task already in state; otherwise the whole submission is rejected
+        before any state is mutated. Pipelines are submitted as complete
+        batches, so a missing dependency is a configuration error and must
+        never be silently dropped.
         """
         tasks = self.store.tasks()
         known_ids = set(tasks)
+        accepted: list[tuple[dict, str | None]] = []
+        added_ids: set[str] = set()
         skipped = []
         for spec in dag_tasks:
             task_id = spec["id"]
@@ -104,6 +122,20 @@ class Scheduler:
                 continue
             if task_id in known_ids:
                 continue
+            accepted.append((spec, key))
+            added_ids.add(task_id)
+
+        available = known_ids | added_ids
+        problems = []
+        for spec, _key in accepted:
+            for dep in spec.get("needs") or []:
+                if dep not in available:
+                    problems.append(f"task {spec['id']!r} needs unknown task {dep!r}")
+        if problems:
+            raise ValueError("invalid DAG: " + "; ".join(problems))
+
+        for spec, key in accepted:
+            task_id = spec["id"]
             known_ids.add(task_id)
             tasks[task_id] = {
                 "id": task_id,
@@ -117,12 +149,10 @@ class Scheduler:
                 "last_started_at": None,
                 "next_attempt_at": None,
                 "exit_code": None,
+                "pid": None,
             }
             if key is not None:
                 self.store.data["idempotency_keys"][key] = task_id
-        # 只保留本状态里真实存在的依赖，避免历史遗留或跨批次的引用把整条链卡住。
-        for task in tasks.values():
-            task["needs"] = [dep for dep in task["needs"] if dep in tasks]
         return skipped
 
     # -- crash recovery -------------------------------------------------------
@@ -131,11 +161,17 @@ class Scheduler:
         """Tasks left 'running' by a kill -9 / power cut become pending again.
 
         Succeeded tasks are never touched, so they never re-run.
+
+        Any orphaned process group left behind by the dead scheduler is
+        killed first, so a recovered task can never run twice at once and
+        abandoned children cannot keep writing data in the background.
         """
         recovered = []
         for task in self.store.tasks().values():
             if task["status"] == RUNNING:
+                self._kill_group(task.get("pid"))
                 task["status"] = PENDING
+                task["pid"] = None
                 recovered.append(task["id"])
         return recovered
 
@@ -170,8 +206,10 @@ class Scheduler:
         self.store.save()
         if self._stop_requested:
             print("shutdown requested: stopped scheduling, running tasks finished, state saved")
-            # 收到停止信号属于预期内的收尾动作，不算这一轮失败。
-            return 0
+            # An interrupted batch is not a successful round, even though
+            # the shutdown itself was graceful: anything not yet finished
+            # makes the exit code non-zero for deployment scripts.
+            return self.exit_code()
         return self.exit_code()
 
     def exit_code(self) -> int:
@@ -215,6 +253,24 @@ class Scheduler:
         return 0.05
 
     def _submit(self, pool, futures, task) -> None:
+        log_path = os.path.join(self.logs_dir, f"{task['id']}.log")
+        log = open(log_path, "ab")
+        log.write(
+            f"\n===== attempt {task['attempts'] + 1} "
+            f"at {_utc_now_iso()} =====\n$ {task['run']}\n".encode()
+        )
+        log.flush()
+        proc = subprocess.Popen(
+            task["run"],
+            shell=True,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        # Flip to RUNNING and persist the process-group leader pid in the
+        # same save right after fork: a kill -9 afterwards leaves enough
+        # state for recovery to kill the orphaned group, so the task can
+        # never run twice at once.
         task["attempts"] += 1
         task["status"] = RUNNING
         now = _utc_now_iso()
@@ -222,26 +278,50 @@ class Scheduler:
             task["started_at"] = now
         task["last_started_at"] = now
         task["next_attempt_at"] = None
+        task["pid"] = proc.pid
         self.store.save()
-        log_path = os.path.join(self.logs_dir, f"{task['id']}.log")
-        futures[pool.submit(self._execute, dict(task), log_path)] = task
+        futures[pool.submit(self._await_proc, proc, log, self.task_timeout)] = task
 
     @staticmethod
-    def _execute(task_snapshot: dict, log_path: str) -> int:
-        with open(log_path, "ab") as log:
-            log.write(
-                f"\n===== attempt {task_snapshot['attempts']} "
-                f"at {_utc_now_iso()} =====\n$ {task_snapshot['run']}\n".encode()
-            )
-            log.flush()
-            proc = subprocess.run(
-                task_snapshot["run"], shell=True, stdout=log, stderr=subprocess.STDOUT
-            )
-            log.write(f"[exit {proc.returncode}]\n".encode())
-            return proc.returncode
+    def _await_proc(proc, log, timeout) -> int:
+        """Wait for an attempt that runs in its own process group.
+
+        ``start_new_session`` puts the shell and every process it spawns
+        into a dedicated process group, so a timeout can kill the whole
+        tree at once. The group is fully reaped before this method
+        returns -- no second instance can start while an abandoned child
+        is still alive and writing.
+        """
+        try:
+            try:
+                returncode = proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                log.write(
+                    f"[timeout after {timeout}s; killed process group {proc.pid}]\n".encode()
+                )
+                log.flush()
+                Scheduler._kill_group(proc.pid)
+                returncode = proc.wait()
+            log.write(f"[exit {returncode}]\n".encode())
+            return returncode
+        finally:
+            log.close()
+
+    @staticmethod
+    def _kill_group(pgid) -> None:
+        """Best-effort SIGKILL of a process group created via start_new_session."""
+        if not pgid:
+            return
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            pass
 
     def _on_complete(self, task, exit_code: int) -> None:
         task["exit_code"] = exit_code
+        task["pid"] = None
         if exit_code == 0:
             task["status"] = SUCCEEDED
             task["finished_at"] = _utc_now_iso()
